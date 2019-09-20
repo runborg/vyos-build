@@ -16,6 +16,10 @@
 # Must be run with --privileged flag, recommended to run the container with a
 # volume mapped in order to easy export images
 
+# To build on emulated qemu arm system use:
+#FROM multiarch/debian-debootstrap:armhf-buster-slim
+#FROM multiarch/debian-debootstrap:arm64-buster-slim
+
 FROM debian:buster
 LABEL authors="VyOS Maintainers <maintainers@vyos.io>"
 
@@ -46,7 +50,6 @@ RUN apt-get update && apt-get install -y \
       autoconf \
       automake \
       dpkg-dev \
-      syslinux \
       genisoimage \
       lsb-release \
       fakechroot \
@@ -71,9 +74,18 @@ RUN apt-get update && apt-get install -y \
       live-build \
       jq
 
+RUN if dpkg-architecture -ii386 || dpkg-architecture -iamd64; then \
+      apt-get update && apt-get install -y syslinux; \
+    fi
+
 # Package needed for mdns-repeater
 RUN apt-get update && apt-get install -y \
       dh-systemd
+
+#Apply fix for https in curl
+RUN if dpkg-architecture -iarmhf; then \
+      echo "cacert=/etc/ssl/certs/ca-certificates.crt" >> ~/.curlrc; \
+    fi
 
 #
 # Building libvyosconf requires a full configured OPAM/OCaml setup
@@ -82,9 +94,9 @@ RUN apt-get update && apt-get install -y \
       libffi-dev \
       libpcre3-dev
 
-RUN curl https://raw.githubusercontent.com/ocaml/opam/2.0.2/shell/install.sh --output /tmp/opam_install.sh && \
+RUN curl https://raw.githubusercontent.com/ocaml/opam/2.0.5/shell/install.sh --output /tmp/opam_install.sh && \
     sed -i 's/read BINDIR/BINDIR=""/' /tmp/opam_install.sh && sh /tmp/opam_install.sh && \
-    opam init --root=/opt/opam --comp=4.07.0 --disable-sandboxing
+    opam init --root=/opt/opam --comp=4.08.1 --disable-sandboxing
 
 RUN eval $(opam env --root=/opt/opam --set-root) && \
     opam install -y \
@@ -119,7 +131,7 @@ RUN eval $(opam env --root=/opt/opam --set-root) && \
     git clone https://github.com/vyos/libvyosconfig.git && \
     cd libvyosconfig && git checkout 9a80a5d3 && \
     dpkg-buildpackage -uc -us -tc -b && \
-    dpkg -i ../libvyosconfig0_*_amd64.deb
+    dpkg -i ../libvyosconfig0_*_$(dpkg-architecture -qDEB_HOST_ARCH).deb
 
 # Packages needed for vyatta-cfg
 RUN apt-get update && apt-get install -y \
@@ -184,7 +196,7 @@ RUN export RTRLIB_VERSION="0.6.3" && \
     wget -P /tmp https://github.com/rtrlib/rtrlib/archive/v${RTRLIB_VERSION}.tar.gz && \
     tar xf /tmp/v${RTRLIB_VERSION}.tar.gz -C /tmp && \
     cd /tmp/rtrlib-${RTRLIB_VERSION} && dpkg-buildpackage -uc -us -tc -b && \
-    dpkg -i ../librtr*_amd64.deb ../librtr*_all.deb
+    dpkg -i ../librtr*_$(dpkg-architecture -qDEB_HOST_ARCH).deb ../librtr*_all.deb
 
 # Packages needed to build frr itself
 # https://github.com/FRRouting/frr/blob/master/doc/developer/building-libyang.rst
@@ -281,12 +293,26 @@ RUN apt-get update && apt-get install -y \
       libmariadb-dev
 
 # Install packer
-RUN export LATEST="$(curl -s https://checkpoint-api.hashicorp.com/v1/check/packer | \
-    jq -r -M '.current_version')"; \
-    echo "url https://releases.hashicorp.com/packer/"$LATEST"/packer_"$LATEST"_linux_amd64.zip" |\
-    curl -K- | gzip -d > /usr/bin/packer && \
-    chmod +x /usr/bin/packer
+RUN if dpkg-architecture -ii386 || dpkg-architecture -iamd64; then \
+      export LATEST="$(curl -s https://checkpoint-api.hashicorp.com/v1/check/packer | \
+      jq -r -M '.current_version')"; \
+      echo "url https://releases.hashicorp.com/packer/"$LATEST"/packer_"$LATEST"_linux_amd64.zip" |\
+      curl -K- | gzip -d > /usr/bin/packer && \
+      chmod +x /usr/bin/packer; \
+    fi
 
+# Install utillities for building grub and u-boot images
+RUN if dpkg-architecture -iarmhf; then \
+      apt-get update && apt-get install -y \
+        dosfstools \
+        u-boot-tools \
+        grub-efi-arm; \
+    elif dpkg-architecture -iarm64; then \
+      apt-get update && apt-get install -y \
+        dosfstools \
+        u-boot-tools \
+        grub-efi-arm64; \
+    fi
 #
 # live-build: building in docker fails with mounting /proc | /sys
 #
