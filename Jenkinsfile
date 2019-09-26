@@ -96,7 +96,7 @@ pipeline {
             filename 'Dockerfile'
             label 'jessie-amd64'
             dir 'docker'
-            args '-v /dev/kvm:/dev/kvm --privileged --sysctl net.ipv6.conf.lo.disable_ipv6=0 -e GOSU_UID=1006 -e GOSU_GID=1006'
+            args '--privileged --sysctl net.ipv6.conf.lo.disable_ipv6=0 -e GOSU_UID=1006 -e GOSU_GID=1006'
         }
     }
     stages {
@@ -120,7 +120,7 @@ pipeline {
         stage('Test') {
             steps {
                 sh """
-                    sudo apt install -y python3-pexpect
+                    sudo apt install -y python3-pexpec kvm qemu-kvm libvirt-bin bridge-utils libguestfs-toolst
                     cd build/ 
                     ../scripts/check-qemu-install --debug live-image-amd64.hybrid.iso
                 """
