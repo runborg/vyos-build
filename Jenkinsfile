@@ -124,7 +124,7 @@ pipeline {
                     ls -al
                     ls -al build/
                     cd build/
-                    ../scripts/check-qemu-install --debug build/live-image-amd64.hybrid.iso-
+                    ../scripts/check-qemu-install --debug build/live-image-amd64.hybrid.iso
                 """
             }
         }
