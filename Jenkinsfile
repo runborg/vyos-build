@@ -120,7 +120,7 @@ pipeline {
         stage('Test') {
             steps {
                 sh """
-                    sudo apt install -y python3-pexpec kvm qemu-kvm libvirt-bin bridge-utils libguestfs-toolst
+                    sudo apt-get update && sudo apt-get install -y python3-pexpect kvm qemu-kvm libvirt-bin bridge-utils libguestfs-tools
                     cd build/ 
                     ../scripts/check-qemu-install --debug live-image-amd64.hybrid.iso
                 """
