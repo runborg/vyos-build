@@ -100,6 +100,7 @@ pipeline {
         stage('Build') {
             steps {
                 sh 'sudo make iso'
+                archiveArtifact artifacts: 'build/live-image-amd64.hybrid.iso'
             }
         }
         stage('Test') {
@@ -112,9 +113,6 @@ pipeline {
         }
     }
     post {
-        always {
-            archiveArtifact artifacts: 'build/live-image-amd64.hybrid.iso'
-        }
         success {
             script {
                 // only deploy ISO if build from official repository
