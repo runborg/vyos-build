@@ -113,7 +113,7 @@ pipeline {
     }
     post {
         always {
-            archiveArtifact artifacts: 'build/vyos*.iso'
+            archiveArtifact artifacts: 'build/live-image-amd64.hybrid.iso'
         }
         success {
             script {
