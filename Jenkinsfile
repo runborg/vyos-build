@@ -112,6 +112,9 @@ pipeline {
         }
     }
     post {
+        always {
+            archiveArtifact artifacts: 'build/vyos*.iso'
+        }
         success {
             script {
                 // only deploy ISO if build from official repository
