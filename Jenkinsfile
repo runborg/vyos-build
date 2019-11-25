@@ -100,7 +100,7 @@ pipeline {
         stage('Build') {
             steps {
                 sh 'sudo make iso'
-                archiveArtifact artifacts: 'build/live-image-amd64.hybrid.iso'
+                archiveArtifacts artifacts: 'build/live-image-amd64.hybrid.iso'
             }
         }
         stage('Test') {
