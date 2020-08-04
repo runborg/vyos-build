@@ -42,7 +42,6 @@ import subprocess
 import traceback
 import logging
 import re
-import rich
 # import yaml
 # from io import BytesIO, StringIO
 from datetime import timedelta
