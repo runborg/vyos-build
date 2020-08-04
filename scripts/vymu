@@ -38,18 +38,18 @@ import os
 import time
 import argparse
 import subprocess
-import random
+# import random
 import traceback
 import logging
 import re
-import yaml
-from io import BytesIO, StringIO
-from datetime import datetime
+import rich
+# import yaml
+# from io import BytesIO, StringIO
+from datetime import timedelta
+import time
 
-DESCRIPTION =  '''
+DESCRIPTION = '''
     Virtual Machine utility to test virtual instances of VyOS
-
-
 '''
 
 CONFIG_FILE = '~/.vyemu.conf'
@@ -59,6 +59,32 @@ DEFAULT_CONFIG = {
     'DISK_NAME': 'vymu-vm{ID:02d}.img',
 }
 
+
+# Create an object that converta a stream to line by line log messages used by pexpect
+class StreamToLogger(object):
+    """
+    Fake file-like stream object that redirects writes to a logger instance.
+    """
+    def __init__(self, logger, log_level=logging.INFO):
+        self.logger = logger
+        self.log_level = log_level
+        self.linebuf = b''
+        self.ansi_escape = re.compile(r'\x1B[@-_][0-?]*[ -/]*[@-~]')
+
+    def write(self, buf):
+        self.linebuf += buf
+        while b'\n' in self.linebuf:
+            f = self.linebuf.split(b'\n', 1)
+            if len(f) == 2:
+                self.logger.debug(self.ansi_escape.sub('', f[0].decode(errors="replace").rstrip()))
+                self.linebuf = f[1]
+
+    def flush(self):
+        pass
+
+# Setting up logger
+log = logging.getLogger(__name__)
+logStream = StreamToLogger(log)
 
 def get_qemu_cmd(name, enable_kvm, disk, iso=None):
     kvm = ""
@@ -85,35 +111,36 @@ def get_qemu_cmd(name, enable_kvm, disk, iso=None):
         {cdrom} \
         {kvm} \
         -drive format=raw,file={disk}'
-
     return cmd
 
 
-class StreamToLogger(object):
-    """
-    Fake file-like stream object that redirects writes to a logger instance.
-    """
-    def __init__(self, logger, log_level=logging.INFO):
-        self.logger = logger
-        self.log_level = log_level
-        self.linebuf = b''
-        self.ansi_escape = re.compile(r'\x1B[@-_][0-?]*[ -/]*[@-~]')
 
-    def write(self, buf):
-        self.linebuf += buf
-        # print('.')
-        while b'\n' in self.linebuf:
-            f = self.linebuf.split(b'\n', 1)
-            if len(f) == 2:
-                self.logger.debug(self.ansi_escape.sub('', f[0].decode(errors="replace").rstrip()))
-                self.linebuf = f[1]
-            # print(f)
-
-    def flush(self):
-        pass
 
 
 def command_sequencer(seq, child):
+    """
+    Generate a sequence of expect commands from a template
+
+    The template is read line by line and splits the command and data by the
+    first colon on that line: 
+
+    Example template:
+    --------
+    info: save config
+    find: \nsave config?
+    send: yes
+    --------
+
+    supported commands: 
+    info: Sends an info message to the logger
+    send: send a line to the session, automatically sends newline at the end
+    find: regex to match, creates an exeption on timeout
+    timeout: sets the timeout value for the next find command in seconds
+             reset to default timeout by 'timeout: default'
+    wait_for_poweroff: Waits for session to become idle and vm to poweroff
+    sleep: sleep parsing and wait for X sec
+    command: send a command and wait for a new prompt, also reads the last commands errorlevel
+    """
     timeout = None
     for _line in seq.splitlines():
         line = _line.lstrip()
@@ -178,154 +205,154 @@ def command_sequencer(seq, child):
             Exception(f"Unknown syntax '{command}'")
 
 
-def do_create(args, config, log, stl):
-    if not os.path.isfile(config['disk_path']):
-        log.info("Creating Disk image {}".format(config['disk_path']))
-        _c = subprocess.check_output(["qemu-img", "create", config['disk_path'], "2G"])
-        # log.debug(_c.decode())
-    else:
-        log.error("Diskimage already exists, please delete prior to recreation")
+
+class Vyemu():
+    def __init__(self, disk_image, kvm=True):
+        # TODO: Validate disk image
+        self.disk_image = disk_image
+        self.kvm = kvm
+
+    def create_disk(self, size=2048, overwrite=False):
+        """
+        Create a new qemu disk image
+        """
+        if not isinstance(size, int):
+            raise ValueError('Size needs to be an integer value')
+        if not overwrite and not os.path.isfile(self.disk_image):
+            log.info(f'Creating Disk image {self.disk_image}')
+            subprocess.check_output(f'qemu-img create {self.disk_image} {size:d}m')
+            return True
+        raise FileExistsError(f'The file specified {self.disk_image} and owerwriting files is disabled')
+
+    def delete_disk(self):
+        log.info(f'Removing disk file: {self.disk_image}')
+        os.remove(self.disk_image)
+
+    def install_vyos(self, iso, autocreate=True):
+        if not os.path.isfile(iso):
+            raise FileNotFoundError(f'ISO file {iso} does not exist')
+
+        if not os.path.isfile(self.disk_image):
+            if not autocreate:
+                raise FileNotFoundError(f'The disk file {self.disk_image} is not existant and autocreate is disabled')
+            log.info('Disk image not found, creating using default config')
+            self.create_disk()
+
+        try:
+            log.info("Installing System")
+            cmd = get_qemu_cmd("TESTVM", self.kvm, disk=self.disk_image, iso=iso)
+            log.debug("Executing command: {cmd}")
+            c = pexpect.spawn(cmd, logfile=logStream)
+
+            # Skipping Grub
+            try:
+                c.expect(['Automatic boot in', 'ISOLINUX.*\n'], timeout=10)
+                c.sendline('')
+            except pexpect.TIMEOUT:
+                log.warning("Did not find grub countdown window, ignoring")
+            
+            # Execute the install sequence
+            command_sequencer(LOGIN + INSTALL_OS + POWEROFF, c)
+
+            c.close()
+            log.info("Image installed successfully")
+
+        except pexpect.exceptions.TIMEOUT:
+            log.error("Timeout waiting for VyOS system")
+            log.error(traceback.format_exc())
+            raise
+
+        except pexpect.exceptions.ExceptionPexpect:
+            log.error("Exeption while executing QEMU")
+            log.error("Is qemu working on this system?")
+            log.error(traceback.format_exc())
+            raise
+
+        except Exception:
+            log.error("An unknown error occured when installing the VyOS system")
+            log.error(traceback.format_exc())
+            raise
+
+    def run(self, iso=None):
+        """
+        Execute an interactive session with the device, all controll is handed over to qemu
+        and stdin/stdout is sent directly to the user
+        """
+        if iso and not os.path.isfile(iso):
+            raise FileNotFoundError(f'ISO file {iso} does not exist')
+
+        if not os.path.isfile(self.disk_image):
+            raise FileNotFoundError('Disk image not found, please create before executing')
+
+        log.info("-------------------------------------------------------------")
+        log.info("Booting into an interactive VyOS system                      ")
+        log.info("Power down the VM or Press ctrl+a x to terminate the session ")
+        log.info("-------------------------------------------------------------")
+        cmd = get_qemu_cmd("TESTVM", self.kvm, disk=self.disk_image, iso=iso)
+        subprocess.run(cmd, shell=True)
+
+    def smoketest(self):
+        """
+        Execute the smoketest suite on this install
+        """
+        if not os.path.isfile(self.disk_image):
+            raise FileNotFoundError(f'Disk image {self.disk_image}, please create and install before running')
+
+        try:
+            log.info("Booting installed system")
+            cmd = get_qemu_cmd("TESTVM", config['kvm'], args.disk)
+            log.debug(f'Executing command: {cmd}')
+            c = pexpect.spawn(cmd, logfile=logStream)
+            try:
+                c.expect('The highlighted entry will be executed automatically in', timeout=10)
+                c.sendline('')
+            except pexpect.TIMEOUT:
+                log.warning("Did not find grub countdown window, ignoring")
+
+            command_sequencer(LOGIN + BASIC_TEST + SMOKETEST + POWEROFF, c)
+            c.close()
+
+        except pexpect.exceptions.TIMEOUT:
+            log.error("Timeout waiting for VyOS system")
+            log.error(traceback.format_exc())
+            raise
+
+        except pexpect.exceptions.ExceptionPexpect:
+            log.error("Exeption while executing QEMU")
+            log.error("Is qemu working on this system?")
+            log.error(traceback.format_exc())
+            raise
+
+        except Exception:
+            log.error("An unknown error occured when installing the VyOS system")
+            traceback.print_exc()
+            raise
 
 
-def do_delete(args, config, log, stl):
-    log.info("Removing disk file: {}".format(config['disk_path']))
-    try:
-        os.remove(config['disk_path'])
-    except Exception:
-        log.error(traceback.format_exc())
-        os.exit("Exception while removing diskimage")
 
+def do_create(app, rgs, config):
+    app.create_disk(overwrite=True)
 
-def do_list(args, config, log, stl):
+def do_delete(app, args, config):
+    app.delete_disk()
+
+def do_list(app, args, config):
     print("LIST - NOT IMPLEMENTED")
 
-
-def do_install(args, config, log, stl):
-    if not os.path.isfile(args.iso):
-        sys.exit("ISO file does not exist")
-
-    if not os.path.isfile(config['disk_path']):
-        log.info('Disk image not found, creating using default config')
-        do_create(args, config)
-
-    try:
-        log.info("Installing System")
-        cmd = get_qemu_cmd("TESTVM", config['kvm'], disk=config['disk_path'], iso=args.iso)
-        log.debug("Executing command: {cmd}")
-        c = pexpect.spawn(cmd, logfile=stl)
-
-        # Skipping Grub
-        try:
-            c.expect('Automatic boot in', timeout=10)
-            c.sendline('')
-        except pexpect.TIMEOUT:
-            log.warning("Did not find grub countdown window, ignoring")
-        command_sequencer(LOGIN + INSTALL_OS + POWEROFF, c)
-        c.close()
-        log.info("Image installed successfully")
-    except pexpect.exceptions.TIMEOUT:
-        log.error("Timeout waiting for VyOS system")
-        log.error(traceback.format_exc())
-
-    except pexpect.exceptions.ExceptionPexpect:
-        log.error("Exeption while executing QEMU")
-        log.error("Is qemu working on this system?")
-        log.error(traceback.format_exc())
-
-    except Exception:
-        log.error("An unknown error occured when installing the VyOS system")
-        log.error(traceback.format_exc())
-
-
-def do_run(args, config, log, stl):
-    if not os.path.isfile(config['disk_path']):
-        os.exit('Disk image not found, please create and install before running')
-    log.info("-------------------------------------------------------")
-    log.info("Installing image and Booting into an interactive system")
-    log.info("to Power down the VM or Press ctrl+a x to terminate")
-    log.info("or shutdown vm by the 'poweroff' command")
-    log.info("-------------------------------------------------------")
-    log.info()
-
-    cmd = get_qemu_cmd("TESTVM", config['kvm'], disk=config['disk_path'])
-    subprocess.run(cmd, shell=True)
-
-
-def do_bootiso(args, config, log, stl):
-    if not os.path.isfile(args.iso):
-        sys.exit("ISO file does not exist")
-
-    if not os.path.isfile(config['disk_path']):
-        log.info('Disk image not found, creating using default config')
-        do_create(args, config)
+def do_install(app, args, config):
+    app.install_vyos(args.iso)
     
-    log.info("-------------------------------------------------------")
-    log.info("Installing image and Booting into an interactive system")
-    log.info("to Power down the VM or Press ctrl+a x to terminate")
-    log.info("or shutdown vm by the 'poweroff' command")
-    log.info("-------------------------------------------------------")
+def do_run(app, args, config):
+    app.run()
 
-    cmd = get_qemu_cmd("TESTVM", config['kvm'], disk=config['disk_path'], iso=args.iso)
-    subprocess.run(cmd, shell=True)
+def do_bootiso(app, args, config):
+    app.run(args.iso)
 
-
-BASIC_TEST = r'''
-    info: Basic CLI Configuration mode test
-    command: configure
-    command: run show version
-    command: exit
-    '''
-
-SMOKETEST = r'''
-    log: Executing smoketest test-suite
-    command: /usr/bin/vyos-smoketest
-    '''
+def do_smoketest(args, config, log):
+    app.smoketest()
 
 
-def do_smoketest(args, config, log, stl):
-    if not os.path.isfile(config['disk_path']):
-        os.exit('Disk image not found, please create and install before running')
 
-    try:
-        log.info("Booting installed system")
-        cmd = get_qemu_cmd("TESTVM", kvm, args.disk)
-        log.debug(f'Executing command: {cmd}')
-        c = pexpect.spawn(cmd, logfile=stl)
-        try:
-            c.expect('The highlighted entry will be executed automatically in', timeout=10)
-            c.sendline('')
-        except pexpect.TIMEOUT:
-            log.warning("Did not find grub countdown window, ignoring")
-
-        command_sequencer(LOGIN + BASIC_TEST + SMOKETEST + POWEROFF, c)
-        c.close()
-
-    except pexpect.exceptions.TIMEOUT:
-        log.error("Timeout waiting for VyOS system")
-        log.error(traceback.format_exc())
-        os.exit(1)
-
-    except pexpect.exceptions.ExceptionPexpect:
-        log.error("Exeption while executing QEMU")
-        log.error("Is qemu working on this system?")
-        log.error(traceback.format_exc())
-        os.exit(1)
-
-    except Exception:
-        log.error("An unknown error occured when installing the VyOS system")
-        traceback.print_exc()
-        os.exit(1)
-
-
-commands = {
-    'create': do_create,
-    'delete': do_delete,
-    'list': do_list,
-    'install': do_install,
-    'run': do_run,
-    'bootiso': do_bootiso,
-    'smoketest': do_smoketest,
-}
 
 
 # Command sequences
@@ -396,8 +423,20 @@ POWEROFF = r'''
     wait_for_poweroff:
     '''
 
+BASIC_TEST = r'''
+    info: Basic CLI Configuration mode test
+    command: configure
+    command: run show version
+    command: exit
+    '''
 
-if __name__ == "__main__":
+SMOKETEST = r'''
+    log: Executing smoketest test-suite
+    command: /usr/bin/vyos-smoketest
+    '''
+
+
+def main():
     parser = argparse.ArgumentParser(description=DESCRIPTION)
     parser.add_argument('-i', '--id', help='ID number of the virtual instance to manage',
                               type=int,
@@ -417,40 +456,46 @@ if __name__ == "__main__":
     subparsers.required = True
 
     create_parser = subparsers.add_parser('create', help='Create a new virtual image to install vyos into')
+    create_parser.set_defaults(func=do_create)
 
     delete_parser = subparsers.add_parser('delete', help='Delete a virtual image')
+    delete_parser.set_defaults(func=do_delete)
 
     list_parser = subparsers.add_parser('list', help='List all available virtual instances found')
-    
+    list_parser.set_defaults(func=do_list)
+
     install_parser = subparsers.add_parser('install', help='Automatically install a ISO to a virtual image')
+    install_parser.set_defaults(func=do_install)
     install_parser.add_argument('iso', help='ISO file to install')
 
     run_parser = subparsers.add_parser('run', help='Run a installed virtual instance and enter the shell')
+    run_parser.set_defaults(func=do_run)
 
     bootiso_parser = subparsers.add_parser('bootiso', help='Boot an iso for manual installation of vyos')
+    bootiso_parser.set_defaults(func=do_bootiso)
     bootiso_parser.add_argument('iso', help='ISO file to boot')
 
     smoketest_parser = subparsers.add_parser('smoketest', help='Execute the smoketest testing suite on a virtual instance')
-
+    smoketest_parser.set_defaults(func=do_smoketest)
     args = parser.parse_args()
 
-    # Setting up logger
-    log = logging.getLogger()
-    log.setLevel(logging.DEBUG)
+    class ElapsedTimeFormatter():
+        def __init__(self):
+            self.init_time = time.time()
 
-    stl = StreamToLogger(log)
-    formatter = logging.Formatter('%(levelname)5s - %(message)s')
+        def format(self, record):
+            elapsed = float(timedelta(seconds=record.created - self.init_time).total_seconds())
+            return f'{elapsed:04.4f} {record.levelname:>7s} - {record.getMessage():s}'
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(ElapsedTimeFormatter())
+    log.addHandler(console)
 
-    handler = logging.StreamHandler(sys.stdout)
     if args.silent:
-        handler.setLevel(logging.ERROR)
+        log.setLevel(logging.ERROR)
     elif args.debug:
-        handler.setLevel(logging.DEBUG)
+        log.setLevel(logging.DEBUG)
     else:
-        handler.setLevel(logging.INFO)
-
-    handler.setFormatter(formatter)
-    log.addHandler(handler)
+        log.setLevel(logging.INFO)
 
     config = DEFAULT_CONFIG.copy()
     if not config['DISK_DIR'].endswith('/'):
@@ -468,5 +513,11 @@ if __name__ == "__main__":
     # Generate Path for disk image
     config['disk_path'] = os.path.expanduser(config['DISK_DIR'] + config['DISK_NAME'].format(ID=args.id))
 
+    app = Vyemu(disk_image=config['disk_path'])
+
     # Execute the command scripts
-    commands[args.command](args, config, log, stl)
+    args.func(app, args, config)
+
+
+if __name__ == "__main__":
+    main()
