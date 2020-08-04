@@ -512,7 +512,7 @@ def main():
     # Generate Path for disk image
     config['disk_path'] = os.path.expanduser(config['DISK_DIR'] + config['DISK_NAME'].format(ID=args.id))
 
-    app = Vyemu(disk_image=config['disk_path'])
+    app = Vyemu(disk_image=config['disk_path'], kvm=config['kvm'])
 
     # Execute the command scripts
     args.func(app, args, config)
