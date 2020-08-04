@@ -45,7 +45,6 @@ import re
 # import yaml
 # from io import BytesIO, StringIO
 from datetime import timedelta
-import time
 
 DESCRIPTION = '''
     Virtual Machine utility to test virtual instances of VyOS
@@ -81,9 +80,11 @@ class StreamToLogger(object):
     def flush(self):
         pass
 
+
 # Setting up logger
 log = logging.getLogger(__name__)
 logStream = StreamToLogger(log)
+
 
 def get_qemu_cmd(name, enable_kvm, disk, iso=None):
     kvm = ""
@@ -109,11 +110,8 @@ def get_qemu_cmd(name, enable_kvm, disk, iso=None):
         -nographic \
         {cdrom} \
         {kvm} \
-        -drive format=raw,file={disk}'
+        -drive format=qcow2,file={disk}'
     return cmd
-
-
-
 
 
 def command_sequencer(seq, child):
@@ -121,7 +119,7 @@ def command_sequencer(seq, child):
     Generate a sequence of expect commands from a template
 
     The template is read line by line and splits the command and data by the
-    first colon on that line: 
+    first colon character on the line.
 
     Example template:
     --------
@@ -130,7 +128,8 @@ def command_sequencer(seq, child):
     send: yes
     --------
 
-    supported commands: 
+    supported commands:
+
     info: Sends an info message to the logger
     send: send a line to the session, automatically sends newline at the end
     find: regex to match, creates an exeption on timeout
@@ -162,6 +161,9 @@ def command_sequencer(seq, child):
             else:
                 timeout = int(data)
 
+        elif command == "wait_for_login":
+            command_sequencer(LOGIN, child)
+
         elif command == 'wait_for_poweroff':
             for i in range(30):
                 log.info('Waiting for shutdown...')
@@ -178,10 +180,10 @@ def command_sequencer(seq, child):
 
         elif command == 'command':
             child.sendline(data)
-            i = c.expect([r'\n +Invalid command:',
-                          r'\n +Set failed',
-                          r'No such file or directory',
-                          r'\n\S+@\S+[$#]'], timeout=3600)
+            i = child.expect([r'\n +Invalid command:',
+                              r'\n +Set failed',
+                              r'No such file or directory',
+                              r'\n\S+@\S+[$#]'], timeout=3600)
             if i == 0:
                 raise Exception('Invalid command detected')
             elif i == 1:
@@ -190,7 +192,7 @@ def command_sequencer(seq, child):
                 raise Exception("File not found returned from command")
 
             child.sendline('echo EXITCODE:$\x16?')
-            i = c.expect([r'EXITCODE:0', r'EXITCODE:\d+'], timeout=10)
+            i = child.expect([r'EXITCODE:0', r'EXITCODE:\d+'], timeout=10)
             if i == 0:
                 log.info('Command finished successfully!')
                 pass
@@ -205,11 +207,22 @@ def command_sequencer(seq, child):
 
 
 
+
+
 class Vyemu():
     def __init__(self, disk_image, kvm=True):
         # TODO: Validate disk image
         self.disk_image = disk_image
         self.kvm = kvm
+
+    def _create_snapshot(self):
+        log.info(f'Creating Disk snapshot image {self.disk_image} -> {self.disk_image}.snapshot')
+        subprocess.check_output(['qemu-img', 'create', '-f', 'qcow2', '-b', f'{self.disk_image}', f'{self.disk_image}.snapshot'])
+
+
+    def _delete_snapshot(self):
+        log.info(f'Removing Disk snapshot image {self.disk_image}.snapshot')
+        os.remove(f'{self.disk_image}.snapshot')
 
     def create_disk(self, size=2048, overwrite=False):
         """
@@ -217,11 +230,11 @@ class Vyemu():
         """
         if not isinstance(size, int):
             raise ValueError('Size needs to be an integer value')
-        if not overwrite and not os.path.isfile(self.disk_image):
-            log.info(f'Creating Disk image {self.disk_image}')
-            subprocess.check_output(f'qemu-img create {self.disk_image} {size:d}m')
-            return True
-        raise FileExistsError(f'The file specified {self.disk_image} and owerwriting files is disabled')
+        if not overwrite and os.path.isfile(self.disk_image):
+            raise FileExistsError(f'The file specified {self.disk_image} exists and overwriting files is disabled')
+
+        log.info(f'Creating Disk image {self.disk_image}')
+        subprocess.check_output(['qemu-img', 'create', '-f', 'qcow2', f'{self.disk_image}', f'{size:d}m'])
 
     def delete_disk(self):
         log.info(f'Removing disk file: {self.disk_image}')
@@ -249,7 +262,7 @@ class Vyemu():
                 c.sendline('')
             except pexpect.TIMEOUT:
                 log.warning("Did not find grub countdown window, ignoring")
-            
+
             # Execute the install sequence
             command_sequencer(LOGIN + INSTALL_OS + POWEROFF, c)
 
@@ -272,7 +285,7 @@ class Vyemu():
             log.error(traceback.format_exc())
             raise
 
-    def run(self, iso=None):
+    def run(self, iso=None, snapshot=False):
         """
         Execute an interactive session with the device, all controll is handed over to qemu
         and stdin/stdout is sent directly to the user
@@ -282,15 +295,79 @@ class Vyemu():
 
         if not os.path.isfile(self.disk_image):
             raise FileNotFoundError('Disk image not found, please create before executing')
+        if snapshot:
+            self._create_snapshot()
+            filename = f'{self.disk_image}.snapshot'
+        else:
+            filename = self.disk_image
 
         log.info("-------------------------------------------------------------")
         log.info("Booting into an interactive VyOS system                      ")
         log.info("Power down the VM or Press ctrl+a x to terminate the session ")
         log.info("-------------------------------------------------------------")
-        cmd = get_qemu_cmd("TESTVM", self.kvm, disk=self.disk_image, iso=iso)
-        subprocess.run(cmd, shell=True)
+        cmd = get_qemu_cmd("TESTVM", self.kvm, disk=filename, iso=iso)
+        try:
+            subprocess.run(cmd, shell=True)
+        except Exception:
+            if snapshot:
+                self._delete_snapshot()
+            raise
 
-    def smoketest(self):
+    def run_sequence(self, sequence, snapshot=False):
+        """
+        Boot a virtual instance and execute a custom sequence
+        """
+        if not os.path.isfile(self.disk_image):
+            raise FileNotFoundError(f'Disk image {self.disk_image}, please create before executing')
+
+        if snapshot:
+            self._create_snapshot()
+            filename = f'{self.disk_image}.snapshot'
+        else:
+            filename = self.disk_image
+
+        try:
+            log.info("Running Sequence")
+            cmd = get_qemu_cmd("TESTVM", self.kvm, disk=filename)
+            log.debug("Executing command: {cmd}")
+            c = pexpect.spawn(cmd, logfile=logStream)
+
+            # Skipping Grub
+            try:
+                c.expect(['The highlighted entry will be executed automatically in'], timeout=10)
+                c.sendline('')
+            except pexpect.TIMEOUT:
+                log.warning("Did not find grub countdown window, ignoring")
+
+            # Execute the install sequence
+            command_sequencer(sequence, c)
+
+            c.close()
+            log.info("Sequence executed successfully")
+
+        except pexpect.exceptions.TIMEOUT:
+            log.error("Timeout waiting for VyOS system")
+            log.error(traceback.format_exc())
+            if snapshot:
+                self._delete_snapshot()
+            raise
+
+        except pexpect.exceptions.ExceptionPexpect:
+            log.error("Exeption while executing QEMU")
+            log.error("Is qemu working on this system?")
+            log.error(traceback.format_exc())
+            if snapshot:
+                self._delete_snapshot()
+            raise
+
+        except Exception:
+            log.error("An unknown error occured when installing the VyOS system")
+            log.error(traceback.format_exc())
+            if snapshot:
+                self._delete_snapshot()
+            raise
+
+    def smoketest(self, snapshot=False):
         """
         Execute the smoketest suite on this install
         """
@@ -299,7 +376,12 @@ class Vyemu():
 
         try:
             log.info("Booting installed system")
-            cmd = get_qemu_cmd("TESTVM", config['kvm'], args.disk)
+            if snapshot:
+                self._create_snapshot()
+                filename = f'{self.disk_image}.snapshot'
+            else:
+                filename = self.disk_image
+            cmd = get_qemu_cmd("TESTVM", self.kvm, filename)
             log.debug(f'Executing command: {cmd}')
             c = pexpect.spawn(cmd, logfile=logStream)
             try:
@@ -314,44 +396,65 @@ class Vyemu():
         except pexpect.exceptions.TIMEOUT:
             log.error("Timeout waiting for VyOS system")
             log.error(traceback.format_exc())
+            if snapshot:
+                self._delete_snapshot()
             raise
 
         except pexpect.exceptions.ExceptionPexpect:
             log.error("Exeption while executing QEMU")
             log.error("Is qemu working on this system?")
             log.error(traceback.format_exc())
+            if snapshot:
+                self._delete_snapshot()
             raise
 
         except Exception:
             log.error("An unknown error occured when installing the VyOS system")
             traceback.print_exc()
+            if snapshot:
+                self._delete_snapshot()
             raise
-
 
 
 def do_create(app, rgs, config):
     app.create_disk(overwrite=True)
 
+
 def do_delete(app, args, config):
     app.delete_disk()
+
 
 def do_list(app, args, config):
     print("LIST - NOT IMPLEMENTED")
 
+
 def do_install(app, args, config):
     app.install_vyos(args.iso)
-    
+
+
 def do_run(app, args, config):
     app.run()
+
 
 def do_bootiso(app, args, config):
     app.run(args.iso)
 
-def do_smoketest(args, config, log):
+
+def do_smoketest(app, args, config):
     app.smoketest()
 
 
-
+def do_sequence(app, args, config):
+    if args.file.strip() == '-':
+        # Load sequence from stdin
+        f = sys.stdin.read()
+    elif os.path.isfile(args.file):
+        # Load from file
+        with open(args.file, 'r') as _f:
+            f = _f.read()
+    else:
+        os.exit('Unable to load sequence')
+    app.run_sequence(f, snapshot=True)
 
 
 # Command sequences
@@ -368,7 +471,7 @@ LOGIN = r'''
     send: vyos
     find: vyos@vyos:~\$
     info: Logged in!
-    sleep: 10
+    sleep: 5
     '''
 
 INSTALL_OS = r'''
@@ -470,12 +573,17 @@ def main():
     run_parser = subparsers.add_parser('run', help='Run a installed virtual instance and enter the shell')
     run_parser.set_defaults(func=do_run)
 
+    sequence_parser = subparsers.add_parser('sequence', help='Boot virtual instance and execute a custom sequence')
+    sequence_parser.set_defaults(func=do_sequence)
+    sequence_parser.add_argument('file', help='Filename to load sequence from or - for STDIN')
+
     bootiso_parser = subparsers.add_parser('bootiso', help='Boot an iso for manual installation of vyos')
     bootiso_parser.set_defaults(func=do_bootiso)
     bootiso_parser.add_argument('iso', help='ISO file to boot')
 
-    smoketest_parser = subparsers.add_parser('smoketest', help='Execute the smoketest testing suite on a virtual instance')
+    smoketest_parser = subparsers.add_parser('smoketest', help='Execute the smoketest suite on a virtual instance')
     smoketest_parser.set_defaults(func=do_smoketest)
+
     args = parser.parse_args()
 
     class ElapsedTimeFormatter():
